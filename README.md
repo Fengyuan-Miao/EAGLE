@@ -280,6 +280,136 @@ python -m eagle.evaluation.gen_baseline_answer_llama3chat --ea-model-path yuhuil
 ```
 The above two commands will each generate a .jsonl file that records the generation results and wall time. Then, you can use evaluation/speed.py to calculate the ratio of speeds.
 
+## Project: EAGLE Inference-Time Optimization
+
+This fork adds inference-time experiment hooks for profiling, OPT-Tree, Dynamic Depth Decoding (DDD), and the combined OPT-Tree + DDD mode. The default EAGLE behavior is unchanged unless a new `spec_mode` or CLI flag is enabled.
+
+### Setup
+
+Install the normal project dependencies first:
+
+```bash
+pip install -r requirements.txt
+```
+
+The local Qwen3-1.7B EAGLE-3 draft checkpoint used by the provided scripts is:
+
+```bash
+/home/miaofy/models/Qwen3-1.7B_eagle3
+```
+
+Override model paths without editing scripts:
+
+```bash
+export BASE_MODEL_PATH=Qwen/Qwen3-1.7B
+export EA_MODEL_PATH=/home/miaofy/models/Qwen3-1.7B_eagle3
+```
+
+### Run Baseline
+
+This runs vanilla autoregressive decoding and official EAGLE decoding on the same prompt set:
+
+```bash
+bash scripts/run_baseline.sh
+```
+
+Outputs:
+
+```bash
+results/vanilla_ar.jsonl
+results/eagle_baseline.jsonl
+results/profile_baseline.jsonl
+```
+
+### Run OPT-Tree
+
+```bash
+bash scripts/run_opt_tree.sh
+```
+
+Optional budget override:
+
+```bash
+OPT_TREE_BUDGET=64 bash scripts/run_opt_tree.sh
+```
+
+The tuned default for Qwen3-1.7B is `OPT_TREE_BUDGET=32` with `OPT_TREE_DEPTH=3`, which keeps 32 verification nodes but builds them from a shallower candidate tree.
+
+### Run DDD
+
+```bash
+bash scripts/run_ddd.sh
+```
+
+The tuned default for Qwen3-1.7B is `DDD_MAX_DEPTH=4`, which reduced draft time while preserving most of the accepted-token length in the local benchmark.
+
+### Run Combined Method
+
+```bash
+bash scripts/run_combo.sh
+```
+
+The combined script uses the same tuned `DDD_MAX_DEPTH=4` and `OPT_TREE_BUDGET=32` defaults.
+
+### Run All And Collect
+
+```bash
+bash scripts/run_all.sh
+```
+
+This writes `results/summary.csv` with throughput, latency, accepted length, draft depth, node counts, and profiling ratios.
+
+### Direct Benchmark CLI
+
+```bash
+python scripts/benchmark.py \
+  --decode-mode eagle \
+  --spec-mode opt_tree_ddd \
+  --base-model-path Qwen/Qwen3-1.7B \
+  --ea-model-path /home/miaofy/models/Qwen3-1.7B_eagle3 \
+  --ddd-max-depth 4 \
+  --ddd-checkpoints 3,5,7 \
+  --ddd-thresholds=-100,-100,-100 \
+  --opt-tree-budget 32 \
+  --opt-tree-overexpand-factor 1.0 \
+  --enable-profile \
+  --profile-output results/profile_combo.jsonl \
+  --output results/combo.jsonl
+```
+
+Supported `--spec-mode` values are `baseline`, `opt_tree`, `ddd`, and `opt_tree_ddd`.
+
+### Expected Output Schema
+
+Each benchmark JSONL row contains:
+
+```json
+{
+  "run_id": "eagle_baseline_001",
+  "mode": "eagle_baseline",
+  "model": "Qwen/Qwen3-1.7B",
+  "draft_model": "/home/miaofy/models/Qwen3-1.7B_eagle3",
+  "prompt_id": 0,
+  "prompt_len": 128,
+  "max_new_tokens": 128,
+  "generated_tokens": 128,
+  "wall_time_s": 3.21,
+  "tokens_per_s": 39.88,
+  "temperature": 0.0,
+  "top_p": 1.0,
+  "seed": 42
+}
+```
+
+When profiling is enabled, rows also include summary fields such as `mean_accepted_len`, `mean_draft_depth`, `mean_draft_nodes`, `mean_verified_nodes`, `draft_time_ratio`, `verify_time_ratio`, and `tree_construct_time_ratio`. Step-level profile records are written to `--profile-output`.
+
+### Notes
+
+- The drafter is not retrained.
+- The target model logits and verifier acceptance rule are not changed.
+- OPT-Tree only changes which connected draft nodes are verified under a node budget.
+- DDD only changes how deep draft expansion goes at configured checkpoints.
+
 ## 🌟 Our Contributors
 
 A heartfelt thank you to all our contributors.

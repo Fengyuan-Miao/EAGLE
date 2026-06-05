@@ -1,0 +1,22 @@
+[
+  {
+    "id": 0,
+    "category": "chat",
+    "prompt": "Explain speculative decoding in simple terms."
+  },
+  {
+    "id": 1,
+    "category": "code",
+    "prompt": "Write a Python function to merge two sorted lists."
+  },
+  {
+    "id": 2,
+    "category": "math",
+    "prompt": "Solve the equation step by step: 3x + 5 = 20."
+  },
+  {
+    "id": 3,
+    "category": "summary",
+    "prompt": "Summarize this paragraph: Speculative decoding uses a small draft model to propose several future tokens, then asks the larger target model to verify them in parallel."
+  }
+]

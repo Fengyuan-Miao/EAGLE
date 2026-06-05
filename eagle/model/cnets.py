@@ -22,6 +22,7 @@ import copy
 import os
 # os.environ["CUDA_VISIBLE_DEVICES"] = "5"
 import math
+from contextlib import nullcontext
 from typing import List, Optional, Tuple, Union
 import torch.nn.functional as F
 import torch.utils.checkpoint
@@ -40,6 +41,13 @@ except:
     from utils_c import *
     from choices import *
     from utils import prepare_logits_processor
+
+try:
+    from ..optim.dynamic_depth import should_stop_drafting
+    from ..optim.opt_tree import DraftNode, OptTreeConfig, select_opt_tree_nodes
+except Exception:
+    from eagle.optim.dynamic_depth import should_stop_drafting
+    from eagle.optim.opt_tree import DraftNode, OptTreeConfig, select_opt_tree_nodes
 
 
 
@@ -667,12 +675,44 @@ class Model(nn.Module):
         self.stable_kv = None
 
     @torch.no_grad()
-    def topK_genrate(self, hidden_states, input_ids, head, logits_processor):
+    def topK_genrate(
+            self,
+            hidden_states,
+            input_ids,
+            head,
+            logits_processor,
+            profiler=None,
+            spec_mode="baseline",
+            opt_tree_config: Optional[OptTreeConfig] = None,
+            ddd_config=None,
+    ):
 
         input_ids = input_ids.to(hidden_states.device)
         total_tokens = self.total_tokens
         depth = self.depth
+        spec_mode = spec_mode or "baseline"
+        opt_tree_enabled = spec_mode in ("opt_tree", "opt_tree_ddd") and opt_tree_config is not None
+        ddd_enabled = spec_mode in ("ddd", "opt_tree_ddd") and ddd_config is not None
+        if ddd_enabled:
+            depth = max(1, ddd_config.max_depth - 1)
+
         top_k = self.top_k
+        if opt_tree_enabled:
+            target_candidates = max(
+                total_tokens,
+                int(math.ceil(max(1, opt_tree_config.budget - 1) * opt_tree_config.overexpand_factor)),
+            )
+            while top_k + depth * top_k * top_k < target_candidates:
+                top_k += 1
+            top_k = min(top_k, self.config.draft_vocab_size)
+
+        tree_mask_init = torch.eye(top_k, device=self.embed_tokens.weight.device)[None, None]
+        position_ids_init = torch.zeros(top_k, device=self.embed_tokens.weight.device, dtype=torch.long)
+
+        def profile_time(name):
+            if profiler is None:
+                return nullcontext()
+            return profiler.time(name)
 
         sample_token = input_ids[:, -1]
 
@@ -686,141 +726,193 @@ class Model(nn.Module):
         len_posi = input_ids.shape[1]
         self.reset()
 
-        # with Timer("draft many"):
-        if hasattr(self, "stable_kv") and self.stable_kv is not None:
-            kv_len = self.stable_kv[0][0].shape[2]
-            out_hidden, past_key_values = self(hidden_states, input_ids=input_ids[:, kv_len:],
-                                               past_key_values=self.stable_kv, use_cache=True)
-        else:
-            out_hidden, past_key_values = self(hidden_states, input_ids=input_ids, use_cache=True)
-        self.stable_kv = past_key_values
-        last_hidden = out_hidden[:, -1]
+        actual_draft_depth = 1
+        with profile_time("draft"):
+            if hasattr(self, "stable_kv") and self.stable_kv is not None:
+                kv_len = self.stable_kv[0][0].shape[2]
+                out_hidden, past_key_values = self(hidden_states, input_ids=input_ids[:, kv_len:],
+                                                   past_key_values=self.stable_kv, use_cache=True)
+            else:
+                out_hidden, past_key_values = self(hidden_states, input_ids=input_ids, use_cache=True)
+            self.stable_kv = past_key_values
+            last_hidden = out_hidden[:, -1]
 
-        # last_headout = head(last_hidden)
-        last_headout = self.lm_head(self.norm(last_hidden))
+            last_headout = self.lm_head(self.norm(last_hidden))
 
-        last_p = self.logsoftmax(last_headout)
-        top = torch.topk(last_p, top_k, dim=-1)
-        topk_index, topk_p = top.indices, top.values
-        scores = topk_p[0]
-        scores_list.append(scores[None])
-        parents_list.append(torch.zeros(1, dtype=torch.long, device=scores.device))
-        if self.config.vocab_size==self.config.draft_vocab_size:
-            ss_token.append(topk_index)
-            input_ids = topk_index
-        else:
-            ss_token.append(topk_index+self.d2t[topk_index])
-            input_ids = topk_index+self.d2t[topk_index]
-        input_hidden = last_hidden[None].repeat(1, top_k, 1)
-        tree_mask = self.tree_mask_init
-        topk_cs_index = torch.arange(top_k, device=self.embed_tokens.weight.device)
-
-        # 4
-        for i in range(depth):
-            self.tree_mask = tree_mask
-            position_ids = len_posi + self.position_ids
-            # with Timer("draft one"):
-            out_hidden, past_key_values = self(input_hidden, input_ids=input_ids, past_key_values=past_key_values,
-                                               position_ids=position_ids, use_cache=True)
-            len_posi += 1
-
-            # with Timer("sort1"):
-            bias1 = top_k if i > 0 else 0
-            bias2 = max(0, i - 1)
-            bias = 1 + top_k ** 2 * bias2 + bias1
-            parents = (topk_cs_index + bias)
-            parents_list.append(parents)
-
-            last_headout = self.lm_head(self.norm(out_hidden[0]))
             last_p = self.logsoftmax(last_headout)
-
             top = torch.topk(last_p, top_k, dim=-1)
             topk_index, topk_p = top.indices, top.values
-
-            cu_scores = topk_p + scores[:, None]
-
-            topk_cs = torch.topk(cu_scores.view(-1), top_k, dim=-1)
-            topk_cs_index, topk_cs_p = topk_cs.indices, topk_cs.values
-            scores = topk_cs_p
-
-            out_ids = topk_cs_index // top_k
-            input_hidden = out_hidden[:, out_ids]
-
-            input_ids = topk_index.view(-1)[topk_cs_index][None]
-
-            if self.config.vocab_size == self.config.draft_vocab_size:
+            scores = topk_p[0]
+            scores_list.append(scores[None])
+            parents_list.append(torch.zeros(1, dtype=torch.long, device=scores.device))
+            if self.config.vocab_size==self.config.draft_vocab_size:
                 ss_token.append(topk_index)
+                input_ids = topk_index
             else:
-                input_ids = input_ids + self.d2t[input_ids]
                 ss_token.append(topk_index+self.d2t[topk_index])
-            scores_list.append(cu_scores)
-            tree_mask = torch.cat((tree_mask[:, :, out_ids], self.tree_mask_init), dim=3)
+                input_ids = topk_index+self.d2t[topk_index]
+            input_hidden = last_hidden[None].repeat(1, top_k, 1)
+            tree_mask = tree_mask_init
+            topk_cs_index = torch.arange(top_k, device=self.embed_tokens.weight.device)
 
+            for i in range(depth):
+                self.tree_mask = tree_mask
+                position_ids = len_posi + position_ids_init
+                out_hidden, past_key_values = self(input_hidden, input_ids=input_ids, past_key_values=past_key_values,
+                                                   position_ids=position_ids, use_cache=True)
+                len_posi += 1
 
-        scores_list = torch.cat(scores_list, dim=0).view(-1)
-        ss_token_list = torch.cat(ss_token, dim=0).view(-1)
-        top_scores = torch.topk(scores_list, total_tokens, dim=-1)
-        top_scores_index = top_scores.indices
-        top_scores_index = torch.sort(top_scores_index).values
+                bias1 = top_k if i > 0 else 0
+                bias2 = max(0, i - 1)
+                bias = 1 + top_k ** 2 * bias2 + bias1
+                parents = (topk_cs_index + bias)
+                parents_list.append(parents)
 
-        draft_tokens = ss_token_list[top_scores_index]
-        draft_tokens = torch.cat((sample_token, draft_tokens), dim=0)
+                last_headout = self.lm_head(self.norm(out_hidden[0]))
+                last_p = self.logsoftmax(last_headout)
 
-        draft_parents = torch.cat(parents_list, dim=0)[top_scores_index // top_k].long()
-        mask_index = torch.searchsorted(top_scores_index, draft_parents - 1, right=False)
-        # mask_index[(top_scores_index[mask_index]!=draft_parents - 1)]=-1
-        mask_index[draft_parents == 0] = -1
-        mask_index = mask_index + 1
-        mask_index_list = mask_index.tolist()
-        # with Timer("mask"):
-        tree_mask = torch.eye(total_tokens + 1).bool()
-        tree_mask[:, 0] = True
-        for i in range(total_tokens):
-            tree_mask[i + 1].add_(tree_mask[mask_index_list[i]])
+                top = torch.topk(last_p, top_k, dim=-1)
+                topk_index, topk_p = top.indices, top.values
 
+                cu_scores = topk_p + scores[:, None]
 
-        tree_position_ids = torch.sum(tree_mask, dim=1) - 1
+                topk_cs = torch.topk(cu_scores.view(-1), top_k, dim=-1)
+                topk_cs_index, topk_cs_p = topk_cs.indices, topk_cs.values
+                scores = topk_cs_p
 
-        tree_mask = tree_mask.float()[None, None]
-        draft_tokens = draft_tokens[None]
+                out_ids = topk_cs_index // top_k
+                input_hidden = out_hidden[:, out_ids]
+
+                input_ids = topk_index.view(-1)[topk_cs_index][None]
+
+                if self.config.vocab_size == self.config.draft_vocab_size:
+                    ss_token.append(topk_index)
+                else:
+                    input_ids = input_ids + self.d2t[input_ids]
+                    ss_token.append(topk_index+self.d2t[topk_index])
+                scores_list.append(cu_scores)
+                tree_mask = torch.cat((tree_mask[:, :, out_ids], tree_mask_init), dim=3)
+                actual_draft_depth = i + 2
+                if ddd_enabled and should_stop_drafting(actual_draft_depth, scores, ddd_config):
+                    break
+
+        with profile_time("tree_construct"):
+            scores_list = torch.cat(scores_list, dim=0).view(-1)
+            ss_token_list = torch.cat(ss_token, dim=0).view(-1)
+
+            if opt_tree_enabled:
+                parents_by_row = torch.cat(parents_list, dim=0).long()
+                scores_cpu = scores_list.detach().float().cpu().tolist()
+                tokens_cpu = ss_token_list.detach().cpu().tolist()
+                parents_cpu = parents_by_row.detach().cpu().tolist()
+                depth_cache = {0: 0}
+
+                def node_depth(node_id):
+                    if node_id in depth_cache:
+                        return depth_cache[node_id]
+                    marker = int(parents_cpu[(node_id - 1) // top_k])
+                    parent_id = 0 if marker == 0 else marker
+                    depth_cache[node_id] = node_depth(parent_id) + 1
+                    return depth_cache[node_id]
+
+                nodes = [DraftNode(0, None, int(sample_token[0].item()), 0, 1.0, 0.0)]
+                for flat_index, path_logprob in enumerate(scores_cpu):
+                    marker = int(parents_cpu[flat_index // top_k])
+                    parent_id = 0 if marker == 0 else marker
+                    parent_logprob = 0.0 if parent_id == 0 else scores_cpu[parent_id - 1]
+                    local_prob = math.exp(min(0.0, path_logprob - parent_logprob))
+                    nodes.append(
+                        DraftNode(
+                            flat_index + 1,
+                            parent_id,
+                            int(tokens_cpu[flat_index]),
+                            node_depth(flat_index + 1),
+                            local_prob,
+                            path_logprob,
+                        )
+                    )
+                final_budget = max(2, min(opt_tree_config.budget, len(nodes)))
+                selected_ids = select_opt_tree_nodes(
+                    nodes,
+                    OptTreeConfig(
+                        budget=final_budget,
+                        overexpand_factor=opt_tree_config.overexpand_factor,
+                        score=opt_tree_config.score,
+                        ensure_connected=opt_tree_config.ensure_connected,
+                    ),
+                )
+                selected_flat = sorted(node_id - 1 for node_id in selected_ids if node_id != 0)
+                top_scores_index = torch.tensor(selected_flat, dtype=torch.long, device=scores_list.device)
+            else:
+                select_count = min(total_tokens, scores_list.numel())
+                top_scores = torch.topk(scores_list, select_count, dim=-1)
+                top_scores_index = torch.sort(top_scores.indices).values
+
+            selected_tokens = top_scores_index.numel()
+            draft_tokens = ss_token_list[top_scores_index]
+            draft_tokens = torch.cat((sample_token, draft_tokens), dim=0)
+
+            draft_parents = torch.cat(parents_list, dim=0)[top_scores_index // top_k].long()
+            mask_index = torch.searchsorted(top_scores_index, draft_parents - 1, right=False)
+            mask_index[draft_parents == 0] = -1
+            mask_index = mask_index + 1
+            mask_index_list = mask_index.tolist()
+            tree_mask = torch.eye(selected_tokens + 1).bool()
+            tree_mask[:, 0] = True
+            for i in range(selected_tokens):
+                tree_mask[i + 1].add_(tree_mask[mask_index_list[i]])
+
+            tree_position_ids = torch.sum(tree_mask, dim=1) - 1
+
+            tree_mask = tree_mask.float()[None, None].to(hidden_states.device)
+            draft_tokens = draft_tokens[None]
+
+            max_depth = torch.max(tree_position_ids) + 1
+            noleaf_index = torch.unique(mask_index).tolist()
+            noleaf_num = len(noleaf_index) - 1
+            leaf_num = selected_tokens - noleaf_num
+
+            retrieve_indices = torch.zeros(leaf_num, max_depth.item(), dtype=torch.long) - 1
+            retrieve_indices = retrieve_indices.tolist()
+
+            rid = 0
+            position_ids_list = tree_position_ids.tolist()
+
+            for i in range(selected_tokens + 1):
+                if i not in noleaf_index:
+                    cid = i
+                    node_depth_value = position_ids_list[i]
+                    for j in reversed(range(node_depth_value + 1)):
+                        retrieve_indices[rid][j] = cid
+                        cid = mask_index_list[cid - 1]
+                    rid += 1
+
+            if logits_processor is not None:
+                maxitem = selected_tokens + 5
+
+                def custom_sort(lst):
+                    sort_keys = []
+                    for i in range(len(lst)):
+                        sort_keys.append(lst[i] if lst[i] >= 0 else maxitem)
+                    return sort_keys
+
+                retrieve_indices = sorted(retrieve_indices, key=custom_sort)
+
+            retrieve_indices = torch.tensor(retrieve_indices, dtype=torch.long, device=hidden_states.device)
+
+        self.last_tree_metrics = {
+            "candidate_nodes": int(scores_list.numel() + 1),
+            "selected_nodes": int(selected_tokens + 1),
+            "draft_nodes": int(selected_tokens + 1),
+            "verified_nodes": int(selected_tokens + 1),
+            "actual_draft_depth": int(actual_draft_depth),
+            "draft_top_k": int(top_k),
+        }
+        if profiler is not None:
+            for key, value in self.last_tree_metrics.items():
+                profiler.add_scalar(key, value)
 
         del parents_list, scores_list, ss_token, ss_token_list, draft_parents
-
-        # with Timer("retrieve"):
-
-        max_depth = torch.max(tree_position_ids) + 1
-        noleaf_index = torch.unique(mask_index).tolist()
-        noleaf_num = len(noleaf_index) - 1
-        leaf_num = total_tokens - noleaf_num
-
-        retrieve_indices = torch.zeros(leaf_num, max_depth.item(), dtype=torch.long) - 1
-        retrieve_indices = retrieve_indices.tolist()
-
-        rid = 0
-        position_ids_list = tree_position_ids.tolist()
-
-        for i in range(total_tokens + 1):
-            if i not in noleaf_index:
-                cid = i
-                depth = position_ids_list[i]
-                for j in reversed(range(depth + 1)):
-                    retrieve_indices[rid][j] = cid
-                    cid = mask_index_list[cid - 1]
-                rid += 1
-
-        if logits_processor is not None:
-            maxitem = total_tokens + 5
-
-            def custom_sort(lst):
-                # sort_keys=[len(list)]
-                sort_keys = []
-                for i in range(len(lst)):
-                    sort_keys.append(lst[i] if lst[i] >= 0 else maxitem)
-                return sort_keys
-
-            retrieve_indices = sorted(retrieve_indices, key=custom_sort)
-
-        retrieve_indices = torch.tensor(retrieve_indices, dtype=torch.long)
         del mask_index, mask_index_list, noleaf_index, noleaf_num, leaf_num, max_depth, rid
         tree_position_ids = tree_position_ids.to(hidden_states.device)
 

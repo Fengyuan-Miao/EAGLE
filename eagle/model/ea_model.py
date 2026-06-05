@@ -21,6 +21,11 @@ from .cnets import Model
 from .cnets1 import Model as Model1
 from .configs import EConfig
 
+try:
+    from ..optim import DDDConfig, OptTreeConfig, StepProfiler
+except Exception:
+    from eagle.optim import DDDConfig, OptTreeConfig, StepProfiler
+
 
 class EaModel(nn.Module):
 
@@ -45,6 +50,13 @@ class EaModel(nn.Module):
         self.base_model_name_or_path = base_model_name_or_path
         self.tokenizer = AutoTokenizer.from_pretrained(self.base_model_name_or_path, use_fast=False)
         self.use_eagle3 = use_eagle3
+        self.spec_mode = "baseline"
+        self.enable_profile = False
+        self.profile_output = None
+        self.opt_tree_config = None
+        self.ddd_config = None
+        self.last_step_profile = None
+        self.last_profile_summary = {}
         config = EConfig.from_pretrained(ea_model_path)
         with open(ea_model_path, "r") as f:
             con = json.loads(f.read())
@@ -77,6 +89,55 @@ class EaModel(nn.Module):
         self.ea_layer.to(self.base_model.dtype).to(device)
         self.ea_layer.init_tree()
 
+    def configure_speculation(
+            self,
+            spec_mode="baseline",
+            enable_profile=False,
+            profile_output=None,
+            opt_tree_budget=None,
+            opt_tree_overexpand_factor=2.0,
+            opt_tree_score="path_prob",
+            ddd_max_depth=None,
+            ddd_checkpoints=None,
+            ddd_thresholds=None,
+    ):
+        valid_modes = {"baseline", "opt_tree", "ddd", "opt_tree_ddd"}
+        if spec_mode not in valid_modes:
+            raise ValueError(f"Unsupported spec_mode {spec_mode}. Expected one of {sorted(valid_modes)}")
+
+        def parse_tuple(value, cast, default):
+            if value is None:
+                return default
+            if isinstance(value, str):
+                return tuple(cast(x.strip()) for x in value.split(",") if x.strip())
+            return tuple(cast(x) for x in value)
+
+        self.spec_mode = spec_mode
+        self.enable_profile = enable_profile
+        self.profile_output = profile_output
+
+        if spec_mode in ("opt_tree", "opt_tree_ddd"):
+            budget = opt_tree_budget or (self.ea_layer.total_tokens + 1)
+            self.opt_tree_config = OptTreeConfig(
+                budget=int(budget),
+                overexpand_factor=float(opt_tree_overexpand_factor),
+                score=opt_tree_score,
+            )
+        else:
+            self.opt_tree_config = None
+
+        if spec_mode in ("ddd", "opt_tree_ddd"):
+            checkpoints = parse_tuple(ddd_checkpoints, int, (5, 7, 9))
+            thresholds = parse_tuple(ddd_thresholds, float, (-6.0, -8.0, -10.0))
+            self.ddd_config = DDDConfig(
+                max_depth=int(ddd_max_depth or self.ea_layer.depth + 1),
+                checkpoints=checkpoints,
+                thresholds=thresholds,
+            )
+        else:
+            self.ddd_config = None
+        return self
+
     def get_tokenizer(self):
         """Get the tokenizer of the base model.
 
@@ -95,6 +156,15 @@ class EaModel(nn.Module):
             depth=7,
             top_k=10,
             threshold=1.0,
+            spec_mode="baseline",
+            enable_profile=False,
+            profile_output=None,
+            opt_tree_budget=None,
+            opt_tree_overexpand_factor=2.0,
+            opt_tree_score="path_prob",
+            ddd_max_depth=None,
+            ddd_checkpoints=None,
+            ddd_thresholds=None,
             **kwargs,
     ):
         # assert Type=="LLaMA" or "Mixtral"
@@ -167,6 +237,18 @@ class EaModel(nn.Module):
             total_token = cans[times.index(min(times))]
             model.ea_layer.total_tokens = total_token - 1
 
+        model.configure_speculation(
+            spec_mode=spec_mode,
+            enable_profile=enable_profile,
+            profile_output=profile_output,
+            opt_tree_budget=opt_tree_budget,
+            opt_tree_overexpand_factor=opt_tree_overexpand_factor,
+            opt_tree_score=opt_tree_score,
+            ddd_max_depth=ddd_max_depth,
+            ddd_checkpoints=ddd_checkpoints,
+            ddd_thresholds=ddd_thresholds,
+        )
+
         return model
 
     def forward(
@@ -208,6 +290,10 @@ class EaModel(nn.Module):
             is_llama3=False,
 
     ):
+        profiler = StepProfiler(enabled=getattr(self, "enable_profile", False))
+        self.last_step_profile = profiler
+        self.last_profile_summary = {}
+
         if is_llama3:
             stop_token_id = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
 
@@ -243,49 +329,60 @@ class EaModel(nn.Module):
         input_len = input_ids.shape[1]
         reset_tree_mode(self)
         # prefill
+        profiler.start_step(0)
         draft_tokens, retrieve_indices, tree_mask, tree_position_ids, logits, hidden_state, sample_token = initialize_tree(
-            input_ids, self, past_key_values, logits_processor
+            input_ids, self, past_key_values, logits_processor, profiler=profiler
         )
+        profiler.finish_step()
         new_token = 0
         max_length = max_length - self.ea_layer.total_tokens - 10
         for idx in range(max_length):
-            # with Timer("all"):
-            self.base_model.model.tree_mask = tree_mask
+            profiler.start_step(idx + 1)
+            current_tree_metrics = dict(getattr(self.ea_layer, "last_tree_metrics", {}))
+            with profiler.time("step"):
+                self.base_model.model.tree_mask = tree_mask
 
-            draft_tokens = draft_tokens.to(input_ids.device)
-            # Target model forward, get logits
-            logits, hidden_state_new, outputs = tree_decoding(
-                self,
-                draft_tokens,
-                past_key_values,
-                tree_position_ids,
-                input_ids,
-                retrieve_indices,
-            )
-            # retrieve_indices=tree_buffers["retrieve_indices"]
-            # logits = logits[0, retrieve_indices]
-            draft_tokens = torch.cat((draft_tokens, padding), dim=1)
-            candidates = draft_tokens[0, retrieve_indices]
-            # verification
-            best_candidate, accept_length, sample_p = evaluate_posterior(
-                logits, candidates, logits_processor
-            )
-            # print(accept_length)
-            # Adjusting the input sequence, draft model forward
-            input_ids, draft_tokens, retrieve_indices, tree_mask, tree_position_ids, new_token, hidden_state, sample_token = update_inference_inputs(
-                input_ids,
-                candidates,
-                best_candidate,
-                accept_length,
-                retrieve_indices,
-                logits_processor,
-                new_token,
-                past_key_values_data,
-                current_length_data,
-                self,
-                hidden_state_new,
-                sample_p
-            )
+                draft_tokens = draft_tokens.to(input_ids.device)
+                # Target model forward, get logits
+                with profiler.time("verify"):
+                    logits, hidden_state_new, outputs = tree_decoding(
+                        self,
+                        draft_tokens,
+                        past_key_values,
+                        tree_position_ids,
+                        input_ids,
+                        retrieve_indices,
+                    )
+                # retrieve_indices=tree_buffers["retrieve_indices"]
+                # logits = logits[0, retrieve_indices]
+                draft_tokens = torch.cat((draft_tokens, padding), dim=1)
+                candidates = draft_tokens[0, retrieve_indices]
+                # verification
+                with profiler.time("accept"):
+                    best_candidate, accept_length, sample_p = evaluate_posterior(
+                        logits, candidates, logits_processor
+                    )
+                # print(accept_length)
+                # Adjusting the input sequence, draft model forward
+                input_ids, draft_tokens, retrieve_indices, tree_mask, tree_position_ids, new_token, hidden_state, sample_token = update_inference_inputs(
+                    input_ids,
+                    candidates,
+                    best_candidate,
+                    accept_length,
+                    retrieve_indices,
+                    logits_processor,
+                    new_token,
+                    past_key_values_data,
+                    current_length_data,
+                    self,
+                    hidden_state_new,
+                    sample_p,
+                    profiler=profiler,
+                )
+                profiler.add_scalar("accepted_len", int(accept_length) + 1)
+                for key, value in current_tree_metrics.items():
+                    profiler.add_scalar(key, value)
+            profiler.finish_step()
 
             if is_llama3:
                 if stop_token_id in input_ids[0, input_len:].tolist():
@@ -297,6 +394,13 @@ class EaModel(nn.Module):
                 break
             if input_ids.shape[1] > max_length:
                 break
+        self.last_profile_summary = profiler.summarize()
+        if getattr(self, "profile_output", None):
+            profiler.write_jsonl(
+                self.profile_output,
+                metadata={"mode": getattr(self, "spec_mode", "baseline")},
+                append=True,
+            )
         if not log:
             return input_ids
         else:

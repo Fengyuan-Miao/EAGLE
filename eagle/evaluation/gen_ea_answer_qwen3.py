@@ -106,6 +106,15 @@ def get_model_answers(
         total_token=args.total_token,
         depth=args.depth,
         top_k=args.top_k,
+        spec_mode=args.spec_mode,
+        enable_profile=args.enable_profile,
+        profile_output=args.profile_output,
+        opt_tree_budget=args.opt_tree_budget,
+        opt_tree_overexpand_factor=args.opt_tree_overexpand_factor,
+        opt_tree_score=args.opt_tree_score,
+        ddd_max_depth=args.ddd_max_depth,
+        ddd_checkpoints=args.ddd_checkpoints,
+        ddd_thresholds=args.ddd_thresholds,
         torch_dtype=torch.float16,
         low_cpu_mem_usage=True,
         # load_in_8bit=True,
@@ -373,6 +382,19 @@ if __name__ == "__main__":
         "--use-eagle3",
         action="store_true"
     )
+    parser.add_argument(
+        "--spec-mode",
+        choices=["baseline", "opt_tree", "ddd", "opt_tree_ddd"],
+        default="baseline",
+    )
+    parser.add_argument("--enable-profile", action="store_true")
+    parser.add_argument("--profile-output", type=str)
+    parser.add_argument("--opt-tree-budget", type=int)
+    parser.add_argument("--opt-tree-overexpand-factor", type=float, default=2.0)
+    parser.add_argument("--opt-tree-score", type=str, default="path_prob")
+    parser.add_argument("--ddd-max-depth", type=int)
+    parser.add_argument("--ddd-checkpoints", type=str, default="5,7,9")
+    parser.add_argument("--ddd-thresholds", type=str, default="-6,-8,-10")
 
     args = parser.parse_args()
 
